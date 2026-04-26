@@ -680,6 +680,131 @@ CELLS.append(code(r"""
 """))
 
 
+# --------------------------------------------------------------------------
+# 7. Eval the patched fine-tune + comparison
+# --------------------------------------------------------------------------
+CELLS.append(md(r"""
+    ## 7. Eval the patched model on the same dataset
+
+    Same dataset, same eval helper as the baseline. Build a fresh
+    `ChronosPipeline` around the fine-tuned checkpoint and read off MASE/WQL.
+    Also compute CRPS by hand from the sample forecasts &mdash; it's the metric
+    where a parametric calibrated head is most likely to win, and the original
+    eval script doesn't report it.
+"""))
+
+CELLS.append(code(r"""
+    def crps_from_samples(samples, target):
+        '''Approximate continuous ranked probability score from MC samples.
+
+        samples: (n_series, n_samples, horizon)
+        target : (n_series, horizon)
+        Returns the average CRPS over series and horizon.
+        '''
+        s = np.asarray(samples, dtype=np.float64)
+        y = np.asarray(target,  dtype=np.float64)[:, None, :]
+        n = s.shape[1]
+        # E|X - y|
+        term1 = np.mean(np.abs(s - y), axis=1)
+        # 0.5 * E|X - X'| via sorted-sample formula
+        s_sorted = np.sort(s, axis=1)
+        weights = (2 * np.arange(1, n + 1) - n - 1)
+        term2 = (weights[None, :, None] * s_sorted).sum(axis=1) / (n * n)
+        return float(np.mean(term1 - term2))
+
+
+    def run_full_eval(pipeline, dataset_cfg, num_samples=20, batch_size=16):
+        td = make_test_data(**dataset_cfg)
+        pred_len = dataset_cfg["prediction_length"]
+        all_samples, all_targets = [], []
+        for batch in tqdm(batcher(td.input, batch_size=batch_size)):
+            ctx = [torch.tensor(e["target"]) for e in batch]
+            out = pipeline.predict(ctx, prediction_length=pred_len, num_samples=num_samples).numpy()
+            all_samples.append(out)
+        forecast_samples = np.concatenate(all_samples)
+
+        # Re-iterate test data (it's a generator-backed object) for forecasts + targets
+        td2 = make_test_data(**dataset_cfg)
+        forecasts, targets = [], []
+        for s, ts, label in zip(forecast_samples, td2.input, make_test_data(**dataset_cfg).label):
+            forecasts.append(SampleForecast(samples=s, start_date=ts["start"] + len(ts["target"])))
+            targets.append(np.asarray(label["target"], dtype=np.float64))
+
+        td3 = make_test_data(**dataset_cfg)
+        df = evaluate_forecasts(
+            forecasts, test_data=td3,
+            metrics=[MASE(), MeanWeightedSumQuantileLoss(np.arange(0.1, 1.0, 0.1))],
+            batch_size=5000,
+        ).reset_index(drop=True)
+        row = df.to_dict(orient="records")[0]
+
+        crps = crps_from_samples(forecast_samples, np.stack(targets))
+        return {
+            "MASE": row["MASE[0.5]"],
+            "WQL":  row["mean_weighted_sum_quantile_loss"],
+            "CRPS": crps,
+        }
+"""))
+
+CELLS.append(code(r"""
+    # Rebuild the baseline forecasts with the same eval (now also CRPS).
+    baseline_full = run_full_eval(baseline_pipe, DATASET, num_samples=20, batch_size=16)
+    print("baseline (stock chronos-t5-tiny):", baseline_full)
+
+    # Patched-and-fine-tuned pipeline.
+    patched_pipe = build_patched_pipeline(checkpoint="output/run-patched/checkpoint-final")
+    patched_full = run_full_eval(patched_pipe, DATASET, num_samples=20, batch_size=16)
+    print("patched + fine-tuned         :", patched_full)
+"""))
+
+CELLS.append(md(r"""
+    ## 8. Side-by-side and what to read into it
+
+    A short fine-tune on KernelSynth alone is *not* a fair comparison vs. the
+    original Chronos model that saw ~85B tokens of TSMixup + KernelSynth. So
+    don't expect a clean win. What this run *can* tell you:
+
+    1. **Does the patched inference path produce a sane distribution?** If
+       MASE is wildly worse than the baseline (say, 10x), something's still
+       broken in the head. If it's the same order of magnitude, the plumbing
+       works.
+    2. **Is loss going down?** Watch the trainer log output. NLL on the
+       censored Gaussian should drop monotonically; if it plateaus at the
+       initial value, the MLP head can't learn from the lm_head logits and
+       you should switch to projecting from the decoder hidden states.
+    3. **Calibration delta on CRPS**, even with a tiny fine-tune. The
+       parametric head's biggest theoretical advantage is calibration; if
+       CRPS is competitive even when MASE isn't, that's evidence the
+       direction is sound and worth a real (multi-GPU, full corpus)
+       training run.
+
+    Next experiments worth running, in roughly increasing cost:
+
+    - **head from hidden states** &mdash; replace `Linear(d_vocab, 128)` with
+      `Linear(d_model, 128)` and read from `decoder_outputs.last_hidden_state`
+      instead of `outputs.logits`. Cleaner architecture, fewer parameters,
+      should learn faster.
+    - **mixture of K Gaussians** &mdash; closer in expressivity to the
+      4096-way softmax while keeping ordinality. Output `(K, mu_K, sigma_K, weight_K)`.
+    - **learnable bin boundaries** &mdash; the original code hints at this
+      (`trained_boundaries = model.boundaries` at end of train.py) but the
+      buffer is `requires_grad=False`. Flip that and let the boundaries move.
+    - **full-corpus pretraining** of the patched architecture on a single
+      A100 for ~12-24h vs. stock T5-tiny CE pretraining of the same length.
+      That's the apples-to-apples experiment that would actually answer
+      "is this an improvement on Chronos?".
+"""))
+
+CELLS.append(code(r"""
+    import pandas as pd
+    summary = pd.DataFrame([
+        {"model": "stock chronos-t5-tiny", **baseline_full},
+        {"model": "patched + fine-tuned",  **patched_full},
+    ])
+    summary
+"""))
+
+
 def write_notebook():
     for i, cell in enumerate(CELLS):
         cell.setdefault("id", f"cell-{i:03d}")
