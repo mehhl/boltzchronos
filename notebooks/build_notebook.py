@@ -267,6 +267,179 @@ CELLS.append(code(r"""
 """))
 
 
+# --------------------------------------------------------------------------
+# 4. Inference-path bug + patched T5ForMeanScale
+# --------------------------------------------------------------------------
+CELLS.append(md(r"""
+    ## 4. The inference-path bug
+
+    `T5ForMeanScale.forward()` (in `scripts/training/train.py`) writes the
+    censored-Gaussian *probabilities* into `outputs["logits"]`:
+
+    ```python
+    probs = self.cg_vectorized(mean, scale)         # already normalised
+    probs = torch.clamp(probs, 1e-16, 1 - 1e-16)
+    ...
+    outputs["logits"] = probs
+    return outputs
+    ```
+
+    Inference goes through `ChronosPipeline.predict()` -> `ChronosModel.forward()`
+    -> `model.generate(do_sample=True, top_k=50, top_p=1.0, temperature=1.0)`.
+    HuggingFace's sampling path then does, roughly:
+
+    ```python
+    next_token_logits = outputs.logits[:, -1, :]
+    next_token_scores = TemperatureLogitsWarper(T)(next_token_logits)  # /= T
+    next_token_scores = TopKLogitsWarper(k)(next_token_scores)
+    probs = F.softmax(next_token_scores, dim=-1)
+    next_tokens = torch.multinomial(probs, 1)
+    ```
+
+    With our `outputs.logits` already being probabilities in `[1e-16, 1]`, the
+    final `softmax(probs)` gives `exp(probs) / sum(exp(probs))`. Since
+    `exp(p)` for `p in [0, 1]` is in `[1, e]`, the resulting distribution is
+    approximately uniform over whatever survives top-k. We end up sampling
+    nearly uniformly from 50 tokens, which is a great way to torch the
+    forecast.
+
+    The fix is one line: write **log-probabilities** into `outputs["logits"]`
+    instead. Then `softmax(log_probs / T)` recovers the temperature-warped
+    Boltzmann distribution we actually trained.
+
+    While we're in there:
+
+    - hardcoded `cuda` -> use the device of the input,
+    - `init_probs = tensor([0, 0, 0])` is the right *length* (the bin math
+      requires three special-token slots for the default 4096 vocab) but
+      using -1e9 in log space is cleaner than 1e-16 after a clamp,
+    - the weights and biases of the MLP head get a slightly more careful
+      init (Xavier on weights, zeros on biases).
+
+    The architectural choice of reading `(mu, sigma)` from the 4096-d
+    `lm_head` logits rather than from the 256-d decoder hidden states is
+    preserved so the patched class is a drop-in replacement; switching to
+    a hidden-state head is its own ablation.
+"""))
+
+CELLS.append(code(r"""
+    import torch
+    import torch.nn as nn
+    from transformers import T5ForConditionalGeneration
+
+
+    class T5ForMeanScalePatched(T5ForConditionalGeneration):
+        '''Drop-in replacement for boltzchronos's T5ForMeanScale that returns
+        log-probabilities so HuggingFace's sampling path works correctly.'''
+
+        def __init__(self, config, boundaries=None, n_special_tokens=2):
+            super().__init__(config)
+            d_vocab = config.vocab_size
+
+            # MLP from the categorical logits to (mu, sigma).
+            self.mean_scale_head = nn.Sequential(
+                nn.Linear(d_vocab, 128), nn.ReLU(),
+                nn.Linear(128, 16),     nn.ReLU(),
+                nn.Linear(16, 2),
+            )
+            for layer in (0, 2, 4):
+                nn.init.xavier_uniform_(self.mean_scale_head[layer].weight)
+                nn.init.zeros_(self.mean_scale_head[layer].bias)
+
+            if boundaries is None:
+                # Placeholder; train.py overwrites with the tokenizer's real
+                # boundaries (length d_vocab - n_special_tokens - 1 + 2 = 4094
+                # for the default 4096-token config).
+                n_bin_edges = d_vocab - n_special_tokens - 1 + 2
+                boundaries = torch.zeros(n_bin_edges)
+            self.register_buffer("boundaries", boundaries)
+
+            # Number of init slots needed so the final distribution covers all
+            # d_vocab token IDs. With the default Chronos tokenizer this is 3
+            # (pad, eos, and an unused "bucket below -1e20" slot).
+            n_init = d_vocab - (boundaries.numel() - 1)
+            self.register_buffer(
+                "init_log_probs",
+                torch.full((n_init,), -1e9),
+            )
+
+        def _censored_gaussian_logprobs(self, mu, sigma):
+            '''mu, sigma: (B,) -> log-probs of shape (B, vocab).'''
+            b = self.boundaries.to(mu.device).unsqueeze(0)
+            sqrt2 = torch.tensor(2.0, device=mu.device).sqrt()
+            cdf = 0.5 * (1 + torch.erf((b - mu.unsqueeze(1)) / (sigma.unsqueeze(1) * sqrt2)))
+            bin_probs = cdf[:, 1:] - cdf[:, :-1]
+            init = self.init_log_probs.to(mu.device).exp().expand(bin_probs.size(0), -1)
+            probs = torch.cat([init, bin_probs], dim=1)
+            probs = torch.clamp(probs, min=1e-16, max=1.0)
+            return torch.log(probs)
+
+        def forward(self, **kwargs):
+            outputs = super().forward(**kwargs)
+            t5_logits = outputs.logits  # (B, T, V)
+            flat = t5_logits.reshape(-1, t5_logits.size(-1))
+            ms = self.mean_scale_head(flat)
+            mu = ms[:, 0]
+            sigma = torch.relu(ms[:, 1] - 1e-10) + 1e-10
+            log_probs = self._censored_gaussian_logprobs(mu, sigma)  # (B*T, V)
+
+            labels = kwargs.get("labels", None)
+            loss = None
+            if labels is not None:
+                loss = nn.NLLLoss(ignore_index=-100, reduction="mean")(
+                    log_probs, labels.reshape(-1),
+                )
+
+            log_probs = log_probs.reshape(t5_logits.size(0), t5_logits.size(1), -1)
+            outputs["loss"]   = loss
+            outputs["logits"] = log_probs
+            return outputs
+"""))
+
+CELLS.append(md(r"""
+    Quick smoke test: load `amazon/chronos-t5-tiny` weights into the patched
+    class (the MLP head will be Xavier-init since it's not in the checkpoint),
+    plug it into a `ChronosPipeline`, and confirm `predict` returns finite
+    forecasts of the right shape. The numbers will be junk because the head is
+    random; this just verifies the inference plumbing is wired correctly.
+"""))
+
+CELLS.append(code(r"""
+    from transformers import AutoConfig
+    from chronos import ChronosConfig
+    from chronos.chronos import ChronosModel, ChronosPipeline as ChronosPipelineCls
+
+    def build_patched_pipeline(checkpoint="amazon/chronos-t5-tiny", device=DEVICE, dtype=DTYPE):
+        cfg = AutoConfig.from_pretrained(checkpoint)
+        chronos_cfg = ChronosConfig(**cfg.chronos_config)
+        tokenizer = chronos_cfg.create_tokenizer()
+
+        model = T5ForMeanScalePatched.from_pretrained(
+            checkpoint, torch_dtype=dtype,
+        )
+        # Replace the (zero) placeholder boundaries with the real ones from the
+        # tokenizer so the censored-Gaussian integrates over the right bins.
+        model.boundaries = tokenizer.boundaries.to(dtype=dtype)
+        model.config.chronos_config = chronos_cfg.__dict__
+        model.to(device)
+
+        return ChronosPipelineCls(
+            tokenizer=tokenizer,
+            model=ChronosModel(config=chronos_cfg, model=model),
+        )
+
+    smoke_pipe = build_patched_pipeline()
+    ctx = torch.linspace(0, 6.28, 96).sin() * 10 + 50
+    smoke_forecast = smoke_pipe.predict(
+        ctx, prediction_length=4, num_samples=8,
+    )
+    print("forecast shape :", tuple(smoke_forecast.shape))
+    print("contains NaN?  :", torch.isnan(smoke_forecast).any().item())
+    print("median        :", smoke_forecast.median(dim=1).values.flatten().tolist())
+    del smoke_pipe, smoke_forecast
+"""))
+
+
 def write_notebook():
     for i, cell in enumerate(CELLS):
         cell.setdefault("id", f"cell-{i:03d}")
