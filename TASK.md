@@ -6,6 +6,65 @@ this branch leaves off. The branch already contains a runnable notebook
 the inference-path bug, and an offline correctness check
 (`notebooks/test_patched_head.py`). What remains is the actual experiment.
 
+## Read these first, in this order
+
+Roughly an hour of reading. Don't skip &mdash; the experiment is small once
+you have the context, but the failure modes are subtle.
+
+1. **This file.** All of it, end to end. Re-read "Success criteria" twice;
+   the falsification rules are the part that's easy to bend by accident.
+2. **`notebooks/boltzchronos_eval.ipynb`** &mdash; especially the markdown
+   cell titled "The inference-path bug" and the cell defining
+   `T5ForMeanScalePatched`. That's the single most important code change in
+   this branch and the reason the original cloud run looked broken. The cells
+   after it (KernelSynth gen, fine-tune, eval) are a working but tiny version
+   of the experiment you're scaling up.
+3. **`notebooks/test_patched_head.py`** &mdash; runs offline, takes ~5 seconds,
+   verifies the patched head's math (log-probs sum to 1, gradients flow,
+   `generate()` works) and demonstrates the bug numerically. Run it before
+   touching the class, run it again after any change. Treat it as the
+   regression test.
+4. **`scripts/training/train.py:58-176`** &mdash; the original `T5ForMeanScale`
+   class. Read it side-by-side with the patched version in the notebook so
+   you understand exactly what changed and why. Notice the inline `print` on
+   the loss (line 168), the hardcoded `cuda` (lines 70, 74, 92-94), the
+   `init_probs` literal `[0,0,0]`, and the `outputs["logits"] = probs` at
+   line 175. None of these are individually fatal but together they make the
+   training dynamics opaque.
+5. **`scripts/training/train.py:636-868`** &mdash; the training entry point.
+   This is what you'll actually run for the production experiment, after
+   swapping `T5ForMeanScale` for the patched class. Pay attention to the
+   `CustomTrainer.compute_loss` (line 808) and how `boundaries` is plumbed
+   from the tokenizer to the model (line 779).
+6. **`scripts/evaluation/evaluate.py`** &mdash; the eval harness. Correct as-is;
+   you'll add CRPS computation alongside the existing MASE/WQL and dump
+   eval-time logs.
+7. **`scripts/evaluation/configs/zero-shot.yaml`** and `in-domain.yaml` &mdash;
+   the dataset lists. Note the four commented-out datasets in `zero-shot.yaml`
+   (`m4_quarterly`, `m4_yearly`, `dominick`, `m5`); you'll uncomment them.
+8. **`scripts/evaluation/results/zero-shot.csv`** &mdash; the *only* result
+   row from the original cloud run: MASE 71.08, WQL 22.48 on `monash_traffic`
+   vs. seasonal-naive's MASE 1.08, WQL 0.36. ~70x worse than the naive
+   baseline. The owner of this repo recalled the run as "kinda successful"
+   but the artifact disagrees. Most likely cause is the inference-path bug
+   above. Don't be misled by this CSV; it is not a baseline to beat.
+9. **`scripts/training/configs/chronos-t5-tiny.yaml`** &mdash; the training
+   config that most closely matches the published recipe. Start your
+   production run from a copy of this.
+10. **The Chronos paper** ([arXiv:2403.07815](https://arxiv.org/abs/2403.07815)),
+    sections 3 and 5. You don't need the full paper, just enough to know what
+    the published numbers are on the 27-dataset zero-shot benchmark and how
+    they aggregate. Section 5.5 ("Results") has the table you're trying to
+    reproduce a row of.
+
+You can skip:
+
+- The rest of `src/chronos/chronos.py` (unchanged from upstream).
+- The `test/` directory (a dummy random-init checkpoint, useful for unit
+  tests but not for this work).
+- Most of the `scripts/training/configs/debug/` files (per-dataset debug
+  configs from a previous fork; not relevant here).
+
 ## Goal
 
 Decide whether the censored-Gaussian output head ("Boltzmann distribution over
