@@ -440,6 +440,246 @@ CELLS.append(code(r"""
 """))
 
 
+# --------------------------------------------------------------------------
+# 5. Generate a small KernelSynth dataset
+# --------------------------------------------------------------------------
+CELLS.append(md(r"""
+    ## 5. Tiny KernelSynth dataset
+
+    The original Chronos training corpus is ~85B tokens of TSMixup + KernelSynth.
+    For a sniff test we just want a few thousand synthetic GP-prior series so the
+    fine-tune actually has something to learn from. `scripts/kernel-synth.py`
+    is the upstream generator; we re-use the same kernel bank but dial it down to
+    `N_SYNTH` series of length 1024.
+
+    On a Colab T4 with 4 CPU cores, generating ~3000 series takes a few minutes.
+"""))
+
+CELLS.append(code(r"""
+    import sys
+    sys.path.insert(0, "scripts")
+    from importlib import reload
+
+    import kernel_synth_mod  # placeholder so the next import works after reload
+    """ + "" + r"""
+"""))
+# That import dance is silly; let's do a cleaner version that imports the
+# generator directly from the script as a module.
+
+# Replace the placeholder with a real cell.
+CELLS.pop()
+CELLS.append(code(r"""
+    # Reuse the upstream generator from scripts/kernel-synth.py.
+    # The script's filename has a hyphen so we load it manually.
+    import importlib.util, sys
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "kernel_synth", Path("scripts/kernel-synth.py").resolve()
+    )
+    kernel_synth = importlib.util.module_from_spec(spec)
+    sys.modules["kernel_synth"] = kernel_synth
+    spec.loader.exec_module(kernel_synth)
+
+    print("KERNEL_BANK has", len(kernel_synth.KERNEL_BANK), "kernels; LENGTH =", kernel_synth.LENGTH)
+"""))
+
+CELLS.append(md(r"""
+    Generate the synthetic series in parallel and dump them to a GluonTS arrow
+    file under `data/kernelsynth-tiny.arrow`. Tweak `N_SYNTH` if you want to
+    spend more or less compute. With `N_SYNTH = 3000` and `MAX_KERNELS = 4` the
+    file is ~30 MB.
+"""))
+
+CELLS.append(code(r"""
+    import os
+    from pathlib import Path
+    import numpy as np
+    from joblib import Parallel, delayed
+    from tqdm.auto import tqdm
+    from gluonts.dataset.arrow import ArrowWriter
+
+    N_SYNTH      = 3000   # ~3000 series ~= ~3M scalar steps
+    MAX_KERNELS  = 4
+    DATA_DIR     = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+    SYNTH_PATH   = DATA_DIR / "kernelsynth-tiny.arrow"
+
+    if SYNTH_PATH.exists():
+        print(f"{SYNTH_PATH} already exists ({SYNTH_PATH.stat().st_size / 1e6:.1f} MB) - skipping generation")
+    else:
+        n_jobs = max(1, (os.cpu_count() or 2) - 1)
+        series = Parallel(n_jobs=n_jobs)(
+            delayed(kernel_synth.generate_time_series)(max_kernels=MAX_KERNELS)
+            for _ in tqdm(range(N_SYNTH))
+        )
+        ArrowWriter(compression="lz4").write_to_file(series, path=SYNTH_PATH)
+        print(f"wrote {SYNTH_PATH} ({SYNTH_PATH.stat().st_size / 1e6:.1f} MB)")
+"""))
+
+
+# --------------------------------------------------------------------------
+# 6. Short fine-tune
+# --------------------------------------------------------------------------
+CELLS.append(md(r"""
+    ## 6. Short fine-tune of the patched head
+
+    We start from `amazon/chronos-t5-tiny`, swap in `T5ForMeanScalePatched`, and
+    fine-tune for `MAX_STEPS` steps on the synthetic dataset above. The MLP head
+    is randomly initialised (Xavier), the rest of the T5 weights are pre-trained.
+
+    Calibrate `MAX_STEPS` to your compute budget:
+
+    - 500 steps   - few minutes on a T4, basically just smoke test
+    - 2000 steps  - ~20 min on a T4, you can already see whether loss is going down
+    - 5000 steps  - ~50 min on a T4, the regime where eval numbers might mean something
+
+    The point of this run is not to beat Chronos. It's to verify the inference
+    path works end-to-end and produce a checkpoint we can compare against the
+    stock baseline on the same dataset.
+"""))
+
+CELLS.append(code(r"""
+    from functools import partial
+
+    import numpy as np
+    from gluonts.dataset.common import FileDataset
+    from gluonts.itertools import Cyclic, Map, Filter
+    from gluonts.transform import (
+        ExpectedNumInstanceSampler,
+        FilterTransformation,
+        InstanceSplitter,
+        LeavesMissingValues,
+    )
+    from torch.utils.data import IterableDataset, get_worker_info
+    from chronos import ChronosTokenizer
+
+
+    # Trimmed-down version of train.py's ChronosDataset, just enough for the
+    # short fine-tune. No multi-dataset mixing, no shuffle buffer, no causal
+    # path; we only need the seq2seq + KernelSynth case.
+    class TinyChronosDataset(IterableDataset):
+        def __init__(self, file_path, tokenizer, context_length=512,
+                     prediction_length=64, min_past=64, drop_prob=0.2):
+            self.dataset = Filter(
+                lambda e: len(e["target"]) >= min_past + prediction_length,
+                FileDataset(path=Path(file_path), freq="h"),
+            )
+            self.tokenizer = tokenizer
+            self.context_length = context_length
+            self.prediction_length = prediction_length
+            self.min_past = min_past
+            self.drop_prob = drop_prob
+
+        def _splitter(self):
+            return InstanceSplitter(
+                target_field="target",
+                is_pad_field="is_pad",
+                start_field="start",
+                forecast_start_field="forecast_start",
+                instance_sampler=ExpectedNumInstanceSampler(
+                    num_instances=1.0, min_instances=1,
+                    min_past=self.min_past, min_future=self.prediction_length,
+                ),
+                past_length=self.context_length,
+                future_length=self.prediction_length,
+                dummy_value=np.nan,
+            ) + FilterTransformation(
+                condition=lambda e: (~np.isnan(e["past_target"])).sum() > 0
+            )
+
+        def _to_hf(self, entry):
+            past   = torch.tensor(entry["past_target"]).unsqueeze(0)
+            future = torch.tensor(entry["future_target"]).unsqueeze(0)
+            input_ids, attn_mask, scale = self.tokenizer.context_input_transform(past)
+            labels, labels_mask          = self.tokenizer.label_input_transform(future, scale)
+            labels[labels_mask == 0] = -100
+            return {
+                "input_ids":      input_ids.squeeze(0),
+                "attention_mask": attn_mask.squeeze(0),
+                "labels":         labels.squeeze(0),
+            }
+
+        def __iter__(self):
+            data = Cyclic(self.dataset)
+            data = Map(self._preprocess, data)
+            data = self._splitter().apply(data, is_train=True)
+            for entry in data:
+                yield self._to_hf(entry)
+
+        def _preprocess(self, entry):
+            target = np.asarray(entry["target"], dtype=np.float32)
+            if self.drop_prob > 0:
+                p = np.random.uniform(0.0, self.drop_prob)
+                mask = np.random.choice([True, False], size=len(target), p=[p, 1 - p])
+                target = target.copy()
+                target[mask] = np.nan
+            return {"start": entry["start"], "target": target}
+"""))
+
+CELLS.append(code(r"""
+    from transformers import Trainer, TrainingArguments
+
+    MAX_STEPS  = 2000
+    BATCH_SIZE = 16 if torch.cuda.is_available() else 2
+    CTX_LEN    = 512
+    PRED_LEN   = 64
+    LR         = 5e-4
+
+    chronos_cfg_dict = AutoConfig.from_pretrained("amazon/chronos-t5-tiny").chronos_config
+    chronos_cfg      = ChronosConfig(**chronos_cfg_dict)
+    train_tokenizer  = chronos_cfg.create_tokenizer()
+
+    train_ds = TinyChronosDataset(
+        file_path=str(SYNTH_PATH),
+        tokenizer=train_tokenizer,
+        context_length=CTX_LEN,
+        prediction_length=PRED_LEN,
+        min_past=PRED_LEN,
+        drop_prob=0.2,
+    )
+
+    # Patched model from the stock checkpoint, with real boundaries plugged in.
+    train_model = T5ForMeanScalePatched.from_pretrained(
+        "amazon/chronos-t5-tiny", torch_dtype=torch.float32,
+    )
+    train_model.boundaries = train_tokenizer.boundaries.float()
+    train_model.config.chronos_config = chronos_cfg.__dict__
+
+
+    class CustomTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **_):
+            outputs = model(**inputs)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            return (loss, outputs) if return_outputs else loss
+
+
+    args = TrainingArguments(
+        output_dir="output/run-patched",
+        per_device_train_batch_size=BATCH_SIZE,
+        learning_rate=LR,
+        max_steps=MAX_STEPS,
+        save_strategy="no",
+        logging_strategy="steps",
+        logging_steps=50,
+        report_to=[],
+        bf16=torch.cuda.is_available(),
+        gradient_accumulation_steps=1,
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        # torch_compile=True can help on a fresh GPU, off by default to avoid
+        # warmup compile time eating the wallclock budget.
+        torch_compile=False,
+    )
+
+    trainer = CustomTrainer(model=train_model, args=args, train_dataset=train_ds)
+    trainer.train()
+
+    # Persist the run so we can rebuild a pipeline from it.
+    train_model.save_pretrained("output/run-patched/checkpoint-final")
+    print("saved -> output/run-patched/checkpoint-final")
+"""))
+
+
 def write_notebook():
     for i, cell in enumerate(CELLS):
         cell.setdefault("id", f"cell-{i:03d}")
