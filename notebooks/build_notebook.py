@@ -39,6 +39,8 @@ CELLS: list[dict] = []
 # 0. Title
 # --------------------------------------------------------------------------
 CELLS.append(md(r"""
+    <a href="https://colab.research.google.com/github/mehhl/boltzchronos/blob/claude/complete-task-md-v8TeV/notebooks/boltzchronos_eval.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
     # boltzchronos: does the censored-Gaussian head help?
 
     This notebook walks through the boltzchronos modification of Chronos, fixes a
@@ -97,7 +99,7 @@ CELLS.append(code(r"""
     # Run only on Colab/Kaggle. Skip if you've cloned locally.
     import os
     if not os.path.isdir("boltzchronos"):
-        !git clone -b claude/review-boltzmann-chronos-XB7Cj https://github.com/mehhl/boltzchronos.git
+        !git clone -b claude/complete-task-md-v8TeV https://github.com/mehhl/boltzchronos.git
     %cd boltzchronos
 """))
 
