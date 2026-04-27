@@ -46,7 +46,6 @@ from gluonts.transform import (
     FilterTransformation,
     InstanceSplitter,
 )
-from joblib import Parallel, delayed
 from torch.utils.data import IterableDataset
 from tqdm.auto import tqdm
 from transformers import (
@@ -243,11 +242,14 @@ def gen_kernelsynth(out_path: Path, n_synth: int, max_kernels: int = 4):
         print(f"  {out_path} exists ({out_path.stat().st_size / 1e6:.1f} MB) - reusing")
         return
     ks = load_kernel_synth_module()
-    n_jobs = max(1, (os.cpu_count() or 2) - 1)
-    series = Parallel(n_jobs=n_jobs)(
-        delayed(ks.generate_time_series)(max_kernels=max_kernels)
+    # Serial generation: kernel-synth.py is loaded via importlib from a
+    # hyphenated filename, so a joblib loky worker can't re-import it.
+    # 200-series default finishes in ~1 min on a 2-core CPU; bump
+    # MINI_EVAL_N_SYNTH only when paired with a faster box.
+    series = [
+        ks.generate_time_series(max_kernels=max_kernels)
         for _ in tqdm(range(n_synth), desc="kernel-synth")
-    )
+    ]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ArrowWriter(compression="lz4").write_to_file(series, path=out_path)
     print(f"  wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
