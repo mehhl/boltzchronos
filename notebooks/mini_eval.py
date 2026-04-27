@@ -70,6 +70,22 @@ OFFSET_TO_PERIOD = {
     "W": "W", "D": "D", "h": "h", "min": "min", "s": "s",
 }
 
+
+def to_period_freq(freq):
+    """Map a pandas DateOffset alias to a Period-compatible alias.
+
+    pd.infer_freq returns offset aliases like 'YE-DEC' (Year End, December
+    anchor). pd.Period only accepts 'Y-DEC'. Strip the offset suffix off the
+    base part while preserving any '-ANCHOR' tail.
+    """
+    if freq is None or freq in OFFSET_TO_PERIOD:
+        return OFFSET_TO_PERIOD.get(freq, freq)
+    base, sep, anchor = freq.partition("-")
+    if base in OFFSET_TO_PERIOD:
+        period_base = OFFSET_TO_PERIOD[base]
+        return f"{period_base}-{anchor}" if anchor else period_base
+    return freq
+
 DATASETS = {
     "monash_tourism_yearly": dict(
         name="monash_tourism_yearly",
@@ -144,7 +160,7 @@ def hf_to_gluonts(hf_dataset):
         if isinstance(hf_dataset.features[c], hfds.Sequence) and c != "timestamp"
     ]
     freq = pd.infer_freq(hf_dataset[0]["timestamp"])
-    freq = OFFSET_TO_PERIOD.get(freq, freq)
+    freq = to_period_freq(freq)
     out = []
     for entry in hf_dataset:
         for f in ts_fields:

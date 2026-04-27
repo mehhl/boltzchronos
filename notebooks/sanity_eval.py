@@ -35,6 +35,17 @@ OFFSET_TO_PERIOD = {
     "W": "W", "D": "D", "h": "h", "min": "min", "s": "s",
 }
 
+
+def to_period_freq(freq):
+    if freq is None or freq in OFFSET_TO_PERIOD:
+        return OFFSET_TO_PERIOD.get(freq, freq)
+    base, _, anchor = freq.partition("-")
+    if base in OFFSET_TO_PERIOD:
+        period_base = OFFSET_TO_PERIOD[base]
+        return f"{period_base}-{anchor}" if anchor else period_base
+    return freq
+
+
 DATASET = dict(
     name="monash_tourism_yearly",
     hf_repo="autogluon/chronos_datasets",
@@ -50,7 +61,7 @@ def hf_to_gluonts(hf_dataset):
         if isinstance(hf_dataset.features[c], hfds.Sequence) and c != "timestamp"
     ]
     freq = pd.infer_freq(hf_dataset[0]["timestamp"])
-    freq = OFFSET_TO_PERIOD.get(freq, freq)
+    freq = to_period_freq(freq)
     out = []
     for entry in hf_dataset:
         for f in ts_fields:

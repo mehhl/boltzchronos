@@ -185,13 +185,24 @@ CELLS.append(code(r"""
     }
 
 
+    def to_period_freq(freq):
+        # pd.infer_freq returns 'YE-DEC' but pd.Period wants 'Y-DEC'.
+        if freq is None or freq in OFFSET_TO_PERIOD:
+            return OFFSET_TO_PERIOD.get(freq, freq)
+        base, _, anchor = freq.partition("-")
+        if base in OFFSET_TO_PERIOD:
+            period_base = OFFSET_TO_PERIOD[base]
+            return f"{period_base}-{anchor}" if anchor else period_base
+        return freq
+
+
     def hf_to_gluonts(hf_dataset):
         ts_fields = [
             c for c in hf_dataset.features
             if isinstance(hf_dataset.features[c], hfds.Sequence) and c != "timestamp"
         ]
         freq = pd.infer_freq(hf_dataset[0]["timestamp"])
-        freq = OFFSET_TO_PERIOD.get(freq, freq)
+        freq = to_period_freq(freq)
         out = []
         for entry in hf_dataset:
             for f in ts_fields:
