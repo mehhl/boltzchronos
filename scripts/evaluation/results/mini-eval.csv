@@ -1,0 +1,3 @@
+model,dataset,MASE,WQL,CRPS,train_steps,device,elapsed_s
+stock-chronos-t5-tiny,monash_tourism_yearly,3.766065,0.187717,84612.975402,0,cpu,14.3
+boltzchronos-patched,monash_tourism_yearly,49.410842,3.870532,1840247.167015,200,cpu,12.1
