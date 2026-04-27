@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -14,8 +15,10 @@ from gluonts.itertools import batcher
 from gluonts.model.evaluation import evaluate_forecasts
 from gluonts.model.forecast import SampleForecast
 from tqdm.auto import tqdm
+from transformers import AutoConfig
 
-from chronos import ChronosPipeline
+from chronos import ChronosConfig, ChronosPipeline
+from chronos.chronos import ChronosModel
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -282,6 +285,40 @@ def crps_from_samples(samples: np.ndarray, targets: np.ndarray) -> float:
     return float(np.mean(term1 - term2))
 
 
+def _build_patched_pipeline(checkpoint, head_variant, device, torch_dtype):
+    """Manual pipeline assembly for the censored-Gaussian head variants.
+
+    ChronosPipeline.from_pretrained dispatches via AutoModelForSeq2SeqLM,
+    which doesn't know about our T5ForMeanScale* subclasses. We construct
+    the pipeline by hand: load the checkpoint with the chosen variant
+    class, plug in the tokenizer's real boundaries (persistent=False
+    buffers aren't in the state_dict), and wrap in ChronosPipeline.
+    """
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1] / "training"),
+    )
+    from train import HEAD_VARIANTS  # noqa: E402
+
+    if head_variant not in HEAD_VARIANTS:
+        raise ValueError(
+            f"unknown head_variant {head_variant!r}; "
+            f"expected one of {list(HEAD_VARIANTS)}"
+        )
+
+    cfg = AutoConfig.from_pretrained(checkpoint)
+    chronos_cfg = ChronosConfig(**cfg.chronos_config)
+    tokenizer = chronos_cfg.create_tokenizer()
+    model_cls = HEAD_VARIANTS[head_variant]
+    model = model_cls.from_pretrained(checkpoint, torch_dtype=torch_dtype)
+    model.boundaries = tokenizer.boundaries.to(dtype=torch_dtype)
+    model.config.chronos_config = chronos_cfg.__dict__
+    model.to(device)
+    return ChronosPipeline(
+        tokenizer=tokenizer,
+        model=ChronosModel(config=chronos_cfg, model=model),
+    )
+
+
 @app.command()
 def main(
     config_path: Path,
@@ -294,17 +331,24 @@ def main(
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
+    head_variant: Optional[str] = None,
 ):
     if isinstance(torch_dtype, str):
         torch_dtype = getattr(torch, torch_dtype)
     assert isinstance(torch_dtype, torch.dtype)
 
-    # Load Chronos
-    pipeline = ChronosPipeline.from_pretrained(
-        chronos_model_id,
-        device_map=device,
-        torch_dtype=torch_dtype,
-    )
+    # Load Chronos. With head_variant set, build the patched pipeline by
+    # hand; otherwise stock chronos-via-AutoModelForSeq2SeqLM.
+    if head_variant is not None:
+        pipeline = _build_patched_pipeline(
+            chronos_model_id, head_variant, device, torch_dtype,
+        )
+    else:
+        pipeline = ChronosPipeline.from_pretrained(
+            chronos_model_id,
+            device_map=device,
+            torch_dtype=torch_dtype,
+        )
 
     # Load backtest configs
     with open(config_path) as fp:
@@ -358,6 +402,7 @@ def main(
             {
                 "dataset": dataset_name,
                 "model": chronos_model_id,
+                "head_variant": head_variant or "stock",
                 **metrics[0],
                 "CRPS": crps,
             }

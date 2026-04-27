@@ -1,0 +1,52 @@
+# Architectural-ablation training config: 25k steps, single GPU, grad-accum
+# to match the published recipe's effective batch of 256. Run three times
+# (one per HEAD_VARIANTS key) to pick the architectural winner before
+# spending real compute on the 200k-step production run.
+#
+# Override `training_data_paths` to wherever you staged TSMixup +
+# KernelSynth on your box. Example:
+#   python scripts/training/train.py \
+#       --config scripts/training/configs/chronos-t5-tiny-ablation.yaml \
+#       --training-data-paths /data/tsmixup-data.arrow,/data/kernelsynth-data.arrow \
+#       --head-variant hidden \
+#       --output-dir output/ablation-hidden-seed0 \
+#       --seed 0
+training_data_paths:
+- "/data/tsmixup-data.arrow"
+- "/data/kernelsynth-data.arrow"
+probability:
+- 0.9
+- 0.1
+context_length: 512
+prediction_length: 64
+min_past: 60
+max_steps: 25_000
+save_steps: 25_000
+log_steps: 250
+# Single 5090 has 32GB; 32 fits comfortably with bf16. Crank if memory allows.
+per_device_train_batch_size: 32
+# 32 * 8 = 256 effective batch, matching the published recipe.
+gradient_accumulation_steps: 8
+learning_rate: 0.001
+optim: adamw_torch_fused
+num_samples: 20
+shuffle_buffer_length: 100_000
+model_id: google/t5-efficient-tiny
+model_type: seq2seq
+random_init: true
+tie_embeddings: true
+output_dir: ./output/ablation/
+tf32: true
+torch_compile: true
+tokenizer_class: "MeanScaleUniformBins"
+tokenizer_kwargs:
+  low_limit: -15.0
+  high_limit: 15.0
+n_tokens: 4096
+lr_scheduler_type: linear
+warmup_ratio: 0.0
+dataloader_num_workers: 1
+max_missing_prop: 0.9
+use_eos_token: true
+# Default; override on the CLI per run.
+head_variant: lm_head

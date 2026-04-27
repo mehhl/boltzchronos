@@ -1,0 +1,32 @@
+# 5-dataset subset of zero-shot for the architectural ablation step. Picked
+# per TASK.md to span horizons / frequencies / dataset sizes:
+#   monash_tourism_yearly   small,  yearly,  pred=4
+#   exchange_rate           small,  daily,   pred=30
+#   monash_covid_deaths     small,  daily,   pred=30
+#   monash_nn5_weekly       medium, weekly,  pred=8
+#   monash_m1_yearly        small,  yearly,  pred=6
+- name: monash_tourism_yearly
+  hf_repo: autogluon/chronos_datasets
+  offset: -4
+  prediction_length: 4
+  num_rolls: 1
+- name: exchange_rate
+  hf_repo: autogluon/chronos_datasets
+  offset: -30
+  prediction_length: 30
+  num_rolls: 1
+- name: monash_covid_deaths
+  hf_repo: autogluon/chronos_datasets
+  offset: -30
+  prediction_length: 30
+  num_rolls: 1
+- name: monash_nn5_weekly
+  hf_repo: autogluon/chronos_datasets
+  offset: -8
+  prediction_length: 8
+  num_rolls: 1
+- name: monash_m1_yearly
+  hf_repo: autogluon/chronos_datasets
+  offset: -6
+  prediction_length: 6
+  num_rolls: 1

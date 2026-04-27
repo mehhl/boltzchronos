@@ -175,6 +175,249 @@ class T5ForMeanScale(T5ForConditionalGeneration):
         return outputs
 
 
+# ---------------------------------------------------------------------------
+# Head variants for the architectural ablation. See TASK.md / ABLATION.md.
+# All three classes use the chronos MeanScaleUniformBins tokenizer and the
+# same persistent=False boundaries/init_log_probs buffers. The differences:
+#
+#   T5ForMeanScale         lm_head logits (V=4096) -> MLP -> (mu, sigma)
+#   T5ForMeanScaleHidden   decoder hidden states (d_model=64 for tiny)
+#                          -> MLP -> (mu, sigma)
+#   T5ForMeanScaleMixture  decoder hidden states -> MLP -> K=5 mixture
+#                          components (mu_k, sigma_k, w_k)
+#
+# The two new classes share the buffer setup and _init_weights override
+# with T5ForMeanScale; the helper below holds the censored-Gaussian math
+# so we don't ship three subtly-different copies.
+# ---------------------------------------------------------------------------
+def _censored_gaussian_logprobs(boundaries, init_log_probs, mu, sigma):
+    """Single-Gaussian version. mu, sigma: (N,). -> log-probs (N, V)."""
+    b = boundaries.to(mu.device).unsqueeze(0)
+    sqrt2 = torch.tensor(2.0, device=mu.device).sqrt()
+    cdf = 0.5 * (1 + torch.erf((b - mu.unsqueeze(1)) / (sigma.unsqueeze(1) * sqrt2)))
+    bin_probs = torch.clamp(cdf[:, 1:] - cdf[:, :-1], min=1e-16, max=1.0)
+    log_bin_probs = torch.log(bin_probs)
+    init_log = init_log_probs.to(mu.device).expand(log_bin_probs.size(0), -1)
+    return torch.cat([init_log, log_bin_probs], dim=1)
+
+
+def _censored_gaussian_mixture_logprobs(boundaries, init_log_probs,
+                                        mus, sigmas, log_weights):
+    """Mixture version. mus, sigmas, log_weights: (N, K). -> log-probs (N, V).
+
+    log_weights is expected to already be log-softmax-normalised over K.
+    Uses logsumexp_k(log w_k + log p_k(j)) for numerical stability.
+    """
+    b = boundaries.to(mus.device).unsqueeze(0).unsqueeze(0)  # (1, 1, V_bins+1)
+    sqrt2 = torch.tensor(2.0, device=mus.device).sqrt()
+    cdf = 0.5 * (1 + torch.erf(
+        (b - mus.unsqueeze(-1)) / (sigmas.unsqueeze(-1) * sqrt2)
+    ))  # (N, K, V_bins+1)
+    bin_probs = torch.clamp(cdf[..., 1:] - cdf[..., :-1], min=1e-16, max=1.0)
+    log_bin_probs = torch.log(bin_probs)  # (N, K, V_bins)
+    # mixture: log p(j) = logsumexp_k (log w_k + log p_k(j))
+    log_mixture = torch.logsumexp(
+        log_weights.unsqueeze(-1) + log_bin_probs, dim=1,
+    )  # (N, V_bins)
+    init_log = init_log_probs.to(mus.device).expand(log_mixture.size(0), -1)
+    return torch.cat([init_log, log_mixture], dim=1)
+
+
+def _setup_chronos_buffers(model, d_vocab, n_special_tokens, boundaries):
+    if boundaries is None:
+        n_bin_edges = d_vocab - n_special_tokens
+        boundaries = torch.zeros(n_bin_edges)
+    model.register_buffer("boundaries", boundaries, persistent=False)
+    n_init = d_vocab - (boundaries.numel() - 1)
+    model.register_buffer(
+        "init_log_probs", torch.full((n_init,), -1e9), persistent=False,
+    )
+
+
+def _mean_scale_head_init_weights(module):
+    """Re-init helper for use inside _init_weights overrides."""
+    if isinstance(module, nn.Linear) and getattr(module, "_is_mean_scale_head", False):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+class T5ForMeanScaleHidden(T5ForConditionalGeneration):
+    """Variant: read the decoder's last hidden state (d_model) instead of
+    the lm_head logits (d_vocab). Same single-Gaussian output head.
+
+    For T5-tiny d_model=64, so the first MLP layer is Linear(64, 128)
+    instead of Linear(4096, 128) - 64x fewer params on that layer and a
+    much less wasteful representation to learn (mu/sigma) from.
+    """
+
+    def __init__(self, config, boundaries=None, n_special_tokens=2):
+        super().__init__(config)
+        d_model = config.d_model
+
+        self.mean_scale_head = nn.Sequential(
+            nn.Linear(d_model, 128), nn.ReLU(),
+            nn.Linear(128, 16), nn.ReLU(),
+            nn.Linear(16, 2),
+        )
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                layer._is_mean_scale_head = True
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+        _setup_chronos_buffers(self, config.vocab_size, n_special_tokens, boundaries)
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        _mean_scale_head_init_weights(module)
+
+    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None,
+                decoder_attention_mask=None, head_mask=None, decoder_head_mask=None,
+                cross_attn_head_mask=None, encoder_outputs=None, past_key_values=None,
+                inputs_embeds=None, decoder_inputs_embeds=None, labels=None,
+                use_cache=None, output_attentions=None, output_hidden_states=None,
+                return_dict=None):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        # Force decoder hidden states out of the parent forward.
+        outputs = super().forward(
+            input_ids=input_ids, attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask, decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, decoder_inputs_embeds=decoder_inputs_embeds,
+            labels=labels, use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True, return_dict=True,
+        )
+
+        # Last layer of the decoder.
+        sequence_output = outputs.decoder_hidden_states[-1]  # (B, T, d_model)
+        flat = sequence_output.reshape(-1, sequence_output.size(-1))
+        ms = self.mean_scale_head(flat)
+        mu = ms[:, 0]
+        sigma = torch.relu(ms[:, 1] - 1e-10) + 1e-10
+        log_probs = _censored_gaussian_logprobs(
+            self.boundaries, self.init_log_probs, mu, sigma,
+        )
+
+        loss = None
+        if labels is not None:
+            loss = nn.NLLLoss(ignore_index=-100, reduction="mean")(
+                log_probs, labels.reshape(-1),
+            )
+
+        log_probs = log_probs.reshape(
+            sequence_output.size(0), sequence_output.size(1), -1,
+        )
+
+        if not return_dict:
+            return loss, log_probs
+
+        outputs["loss"] = loss
+        outputs["logits"] = log_probs
+        return outputs
+
+
+class T5ForMeanScaleMixture(T5ForConditionalGeneration):
+    """Variant: K-component mixture of censored Gaussians, head reads from
+    decoder hidden states. Output is K means + K log-sigmas + K mixture
+    weights (softmax-normalised). Closer in expressivity to a 4096-way
+    softmax while keeping ordinality.
+    """
+
+    N_COMPONENTS = 5  # K
+
+    def __init__(self, config, boundaries=None, n_special_tokens=2,
+                 n_components=None):
+        super().__init__(config)
+        d_model = config.d_model
+        K = n_components if n_components is not None else self.N_COMPONENTS
+        self.n_components = K
+
+        # Wider MLP than the single-gaussian variants: 3K outputs, more
+        # parameters needed to model multiple modes.
+        self.mean_scale_head = nn.Sequential(
+            nn.Linear(d_model, 128), nn.ReLU(),
+            nn.Linear(128, 32), nn.ReLU(),
+            nn.Linear(32, 3 * K),
+        )
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                layer._is_mean_scale_head = True
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+        _setup_chronos_buffers(self, config.vocab_size, n_special_tokens, boundaries)
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        _mean_scale_head_init_weights(module)
+
+    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None,
+                decoder_attention_mask=None, head_mask=None, decoder_head_mask=None,
+                cross_attn_head_mask=None, encoder_outputs=None, past_key_values=None,
+                inputs_embeds=None, decoder_inputs_embeds=None, labels=None,
+                use_cache=None, output_attentions=None, output_hidden_states=None,
+                return_dict=None):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        outputs = super().forward(
+            input_ids=input_ids, attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask, decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, decoder_inputs_embeds=decoder_inputs_embeds,
+            labels=labels, use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True, return_dict=True,
+        )
+
+        sequence_output = outputs.decoder_hidden_states[-1]  # (B, T, d_model)
+        flat = sequence_output.reshape(-1, sequence_output.size(-1))
+        ms = self.mean_scale_head(flat)  # (N, 3K)
+        K = self.n_components
+        mus = ms[:, :K]
+        sigmas = torch.relu(ms[:, K:2 * K] - 1e-10) + 1e-10
+        log_weights = torch.log_softmax(ms[:, 2 * K:3 * K], dim=-1)
+        log_probs = _censored_gaussian_mixture_logprobs(
+            self.boundaries, self.init_log_probs, mus, sigmas, log_weights,
+        )
+
+        loss = None
+        if labels is not None:
+            loss = nn.NLLLoss(ignore_index=-100, reduction="mean")(
+                log_probs, labels.reshape(-1),
+            )
+
+        log_probs = log_probs.reshape(
+            sequence_output.size(0), sequence_output.size(1), -1,
+        )
+
+        if not return_dict:
+            return loss, log_probs
+
+        outputs["loss"] = loss
+        outputs["logits"] = log_probs
+        return outputs
+
+
+HEAD_VARIANTS = {
+    "lm_head": T5ForMeanScale,
+    "hidden": T5ForMeanScaleHidden,
+    "mixture": T5ForMeanScaleMixture,
+}
+
+
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
@@ -289,18 +532,25 @@ def load_model(
         pad_token_id=0,
         eos_token_id=1,
         boundaries=None,
+        head_variant="lm_head",
 ):
     """
     Load the specified HuggingFace model, adjusting the vocabulary
     size, special token IDs, and initialization options.
 
-    This allows to set a model up for training on a new vocabulary
-    of tokens.
+    `head_variant` selects the architectural variant of the censored-Gaussian
+    output head (see HEAD_VARIANTS): "lm_head" (default, reads lm_head logits),
+    "hidden" (reads decoder hidden states), or "mixture" (K=5 mixture).
     """
     assert model_type in ["seq2seq", "causal"]
+    if head_variant not in HEAD_VARIANTS:
+        raise ValueError(
+            f"unknown head_variant {head_variant!r}; "
+            f"expected one of {list(HEAD_VARIANTS)}"
+        )
     AutoModelClass = (
-        T5ForMeanScale if model_type == "seq2seq" else None
-    )  # Load T5ForMeanScale for seq2seq model type
+        HEAD_VARIANTS[head_variant] if model_type == "seq2seq" else None
+    )
 
     if random_init:
         print("Using random initialization")
@@ -678,6 +928,7 @@ def main(
         top_k: int = 50,
         top_p: float = 1.0,
         seed: Optional[int] = None,
+        head_variant: str = "lm_head",
 ):
     if tf32 and not (
             torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -782,7 +1033,8 @@ def main(
         tie_embeddings=tie_embeddings,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
-        boundaries=shuffled_train_dataset_old.tokenizer.boundaries
+        boundaries=shuffled_train_dataset_old.tokenizer.boundaries,
+        head_variant=head_variant,
     )
 
     # Add extra items to model config so that it's saved in the ckpt
