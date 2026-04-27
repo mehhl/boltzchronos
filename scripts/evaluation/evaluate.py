@@ -258,7 +258,28 @@ def generate_sample_forecasts(
             SampleForecast(samples=item, start_date=forecast_start_date)
         )
 
-    return sample_forecasts
+    return sample_forecasts, forecast_samples
+
+
+def crps_from_samples(samples: np.ndarray, targets: np.ndarray) -> float:
+    """Approximate continuous ranked probability score from MC samples.
+
+    samples: (n_series, n_samples, horizon)
+    targets: (n_series, horizon)
+
+    Uses the energy-form estimator
+        CRPS = E|X - y| - 0.5 * E|X - X'|
+    with the second term computed from sorted samples in O(n log n) per series.
+    Returned as the mean over series and forecast steps.
+    """
+    s = np.asarray(samples, dtype=np.float64)
+    y = np.asarray(targets, dtype=np.float64)[:, None, :]
+    n = s.shape[1]
+    term1 = np.mean(np.abs(s - y), axis=1)
+    s_sorted = np.sort(s, axis=1)
+    weights = (2 * np.arange(1, n + 1) - n - 1)
+    term2 = (weights[None, :, None] * s_sorted).sum(axis=1) / (n * n)
+    return float(np.mean(term1 - term2))
 
 
 @app.command()
@@ -301,7 +322,7 @@ def main(
             f"Generating forecasts for {dataset_name} "
             f"({len(test_data.input)} time series)"
         )
-        sample_forecasts = generate_sample_forecasts(
+        sample_forecasts, forecast_samples = generate_sample_forecasts(
             test_data.input,
             pipeline=pipeline,
             prediction_length=prediction_length,
@@ -326,8 +347,20 @@ def main(
             .reset_index(drop=True)
             .to_dict(orient="records")
         )
+
+        targets = np.stack([
+            np.asarray(label["target"], dtype=np.float64)
+            for label in test_data.label
+        ])
+        crps = crps_from_samples(forecast_samples, targets)
+
         result_rows.append(
-            {"dataset": dataset_name, "model": chronos_model_id, **metrics[0]}
+            {
+                "dataset": dataset_name,
+                "model": chronos_model_id,
+                **metrics[0],
+                "CRPS": crps,
+            }
         )
 
     # Save results to a CSV file

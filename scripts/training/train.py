@@ -56,123 +56,122 @@ from transformers import T5ForConditionalGeneration
 
 
 class T5ForMeanScale(T5ForConditionalGeneration):
-    def __init__(self, config, boundaries=None):
+    """T5 with a censored-Gaussian output head over the chronos bin vocabulary.
+
+    Differences from upstream T5ForConditionalGeneration:
+
+    - An MLP reads the lm_head logits and produces (mu, sigma) of a Gaussian.
+    - The Gaussian is integrated between the tokenizer's bin boundaries to
+      produce a probability distribution over the same vocab. Loss is NLL on
+      those bin probabilities.
+    - `outputs.logits` is the **log-probabilities**, not the probabilities.
+      That matters for HuggingFace's sampling path: model.generate(do_sample=True)
+      runs softmax(logits / T) before multinomial. Returning probs there flattens
+      the distribution; returning log-probs recovers the temperature-warped
+      Boltzmann sampling we trained.
+
+    `boundaries` and `init_log_probs` are persistent=False buffers - they're
+    determined by the chronos tokenizer, not by training, and saving them in
+    the state_dict would create shape-mismatch traps on reload. The actual
+    boundaries are plugged in at load time (see `load_model` below).
+    """
+
+    def __init__(self, config, boundaries=None, n_special_tokens=2):
         super().__init__(config)
-        # Additional layer to project the hidden states to mean and scale
+        d_vocab = config.vocab_size
+
         self.mean_scale_head = nn.Sequential(
-            nn.Linear(4096, 128),
-            nn.ReLU(),
-            nn.Linear(128, 16),
-            nn.ReLU(),
-            nn.Linear(16, 2)
-        )# Output two values: mean and scale
+            nn.Linear(d_vocab, 128), nn.ReLU(),
+            nn.Linear(128, 16), nn.ReLU(),
+            nn.Linear(16, 2),
+        )
+        # Tag for _init_weights. nn.init calls in __init__ no-op under
+        # from_pretrained's meta-tensor path, so we route initialization
+        # through the canonical init machinery.
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                layer._is_mean_scale_head = True
+        self._init_mean_scale_head()
+
         if boundaries is None:
-           self.boundaries = torch.zeros(4094, requires_grad=False).to(torch.device("cuda"))
-        else:
-            self.register_buffer('boundaries', boundaries)
+            # Placeholder. Matches the chronos MeanScaleUniformBins geometry:
+            # default vocab=4096 + 2 special tokens -> 4094 edges, 4093 inner
+            # bins, 3 init slots. load_model() overrides this with the
+            # tokenizer's actual boundaries.
+            n_bin_edges = d_vocab - n_special_tokens
+            boundaries = torch.zeros(n_bin_edges)
+        self.register_buffer("boundaries", boundaries, persistent=False)
 
-        self.init_probs = torch.tensor([0, 0, 0]).to(torch.device("cuda"))
+        n_init = d_vocab - (boundaries.numel() - 1)
+        self.register_buffer(
+            "init_log_probs", torch.full((n_init,), -1e9), persistent=False,
+        )
 
-        torch.nn.init.xavier_uniform_(self.mean_scale_head[0].weight)
-        torch.nn.init.xavier_uniform_(self.mean_scale_head[2].weight)
-        torch.nn.init.xavier_uniform_(self.mean_scale_head[4].weight)
+    def _init_mean_scale_head(self):
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
-    def cg_vectorized(self, mu, sigma):
-        """Vectorized Censored Gaussian using PyTorch.
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, nn.Linear) and getattr(module, "_is_mean_scale_head", False):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
-        In: mu, sigma, 2D tensors of shape (batch_size, 1)
-        Out: a 2D tensor of shape (batch_size, N)
-        where N is the number of probability bins
-        """
-        # Expand boundaries to match batch size
-        expanded_boundaries = self.boundaries.unsqueeze(0).expand(mu.size(0), -1)
+    def _censored_gaussian_logprobs(self, mu, sigma):
+        """mu, sigma: (B,) -> log-probs of shape (B, vocab)."""
+        b = self.boundaries.to(mu.device).unsqueeze(0)
+        sqrt2 = torch.tensor(2.0, device=mu.device).sqrt()
+        cdf = 0.5 * (1 + torch.erf((b - mu.unsqueeze(1)) / (sigma.unsqueeze(1) * sqrt2)))
+        bin_probs = cdf[:, 1:] - cdf[:, :-1]
+        init = self.init_log_probs.to(mu.device).exp().expand(bin_probs.size(0), -1)
+        probs = torch.cat([init, bin_probs], dim=1)
+        probs = torch.clamp(probs, min=1e-16, max=1.0)
+        return torch.log(probs)
 
-        # Calculate the cumulative distribution function values
-        cdf = 0.5 * (1 + torch.erf((expanded_boundaries - mu.unsqueeze(1)) / (sigma.unsqueeze(1) * torch.sqrt(
-            torch.tensor(2).to(
-                torch.device("cuda")
-            )
-        ))))
+    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None,
+                decoder_attention_mask=None, head_mask=None, decoder_head_mask=None,
+                cross_attn_head_mask=None, encoder_outputs=None, past_key_values=None,
+                inputs_embeds=None, decoder_inputs_embeds=None, labels=None,
+                use_cache=None, output_attentions=None, output_hidden_states=None,
+                return_dict=None):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        outputs = super().forward(
+            input_ids=input_ids, attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask, decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, decoder_inputs_embeds=decoder_inputs_embeds,
+            labels=labels, use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states, return_dict=return_dict,
+        )
 
-        # Compute P(pt[i] <= x <= pt[i + 1]) as P(x < pt[i + 1]) - P(x < pt[i])
-        probs = cdf[:, 1:] - cdf[:, :-1]
+        t5_logits = outputs.logits  # (B, T, V)
+        flat = t5_logits.reshape(-1, t5_logits.size(-1))
+        ms = self.mean_scale_head(flat)
+        mu = ms[:, 0]
+        sigma = torch.relu(ms[:, 1] - 1e-10) + 1e-10
+        log_probs = self._censored_gaussian_logprobs(mu, sigma)  # (B*T, V)
 
-        # Prepend P(x = special token 0) and P(x = special token 1)
-        probs = torch.cat([self.init_probs.expand(mu.size(0), -1), probs], dim=1)
-
-        return probs
-
-    def cg(self, mu, sigma):
-        """Censored Gaussian using PyTorch.
-
-        In: mu, sigma, a 1d tensor of length N: [pt[0], pt[1], ..., pt[N - 1]]
-        Out: a 1d tensor of length N - 1:
-        [
-            P(pt[0] < x < pt[1]),
-             ...,
-            P(pt[N - 2] < x < pt[N - 1]),
-        ]
-        for x ~ normal(mu, sigma)
-        """
-
-        # Calculate the cumulative distribution function values
-        cdf = 0.5 * (1 + special.erf((self.boundaries - mu) / (sigma * torch.sqrt(torch.tensor(2).to(sigma.device)))))
-
-        # Compute P(pt[i] <= x <= pt[i + 1]) as P(x < pt[i + 1]) - P(x < pt[i])
-        probs = cdf[1:] - cdf[:-1]
-
-        # Prepend P(x = special token 0) and P(x = special token 1)
-        probs = torch.cat([self.init_probs, probs])
-
-        return probs
-
-    def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None, decoder_attention_mask=None,
-                head_mask=None, decoder_head_mask=None, cross_attn_head_mask=None, encoder_outputs=None,
-                past_key_values=None, inputs_embeds=None, decoder_inputs_embeds=None, labels=None,
-                use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None):
-
-        # Get the standard outputs from the original T5 model
-        outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask,
-                                  decoder_input_ids=decoder_input_ids, decoder_attention_mask=decoder_attention_mask,
-                                  head_mask=head_mask, decoder_head_mask=decoder_head_mask,
-                                  cross_attn_head_mask=cross_attn_head_mask, encoder_outputs=encoder_outputs,
-                                  past_key_values=past_key_values, inputs_embeds=inputs_embeds,
-                                  decoder_inputs_embeds=decoder_inputs_embeds, labels=labels,
-                                  use_cache=use_cache, output_attentions=output_attentions,
-                                  output_hidden_states=output_hidden_states, return_dict=return_dict)
-
-        # Use the last state of the decoder (outputs.logits)
-        t5_logits = outputs.logits
-
-        hidden_shape = t5_logits.shape
-        # Pass through the custom head to get mean and scale
-        mean_scale = self.mean_scale_head(
-            t5_logits.view(-1, t5_logits.size(2)))  # Use the hidden state of the last token
-
-        # print(mean_scale.shape)
-        mean = mean_scale[:, 0]
-        scale = torch.relu(mean_scale[:, 1] - 1e-10) + 1e-10
-
-        probs = self.cg_vectorized(mean, scale)
-        probs = torch.clamp(probs, 1e-16, 1 - 1e-16)  # ie not clamping probs
-        log_probs = torch.log(probs)
-
-
-        # that model that we use say to ignore token -100,
-        # https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py#L1771
         loss = None
-
         if labels is not None:
-            nll_loss = nn.NLLLoss(ignore_index=-100, reduction="mean")
-            loss = nll_loss(log_probs, labels.view(-1))
-            print(f"{loss.item()=}")
+            loss = nn.NLLLoss(ignore_index=-100, reduction="mean")(
+                log_probs, labels.reshape(-1),
+            )
 
-        probs = probs.view(hidden_shape[0], hidden_shape[1], probs.shape[1])
+        log_probs = log_probs.reshape(t5_logits.size(0), t5_logits.size(1), -1)
+
         if not return_dict:
-            return loss, probs
+            return loss, log_probs
 
         outputs["loss"] = loss
-        outputs["logits"] = probs
+        outputs["logits"] = log_probs
         return outputs
 
 
@@ -303,8 +302,6 @@ def load_model(
         T5ForMeanScale if model_type == "seq2seq" else None
     )  # Load T5ForMeanScale for seq2seq model type
 
-    print(f"boundaries: {boundaries}")
-
     if random_init:
         print("Using random initialization")
         config = T5Config.from_pretrained(model_id)
@@ -312,6 +309,7 @@ def load_model(
         # Modify config as needed for T5ForMeanScale
         config.initializer_factor = 0.05
         config.tie_word_embeddings = tie_embeddings
+        config.vocab_size = vocab_size
 
         model = AutoModelClass(config, boundaries=boundaries)
     else:
@@ -319,6 +317,14 @@ def load_model(
         model = AutoModelClass.from_pretrained(model_id)
 
     model.resize_token_embeddings(vocab_size)
+
+    # Plug the tokenizer's actual boundaries into the (persistent=False)
+    # buffer. random_init goes through __init__(boundaries=...) above; the
+    # pretrained path doesn't pass them, so override here for both for
+    # uniformity. Without this the model integrates the censored Gaussian
+    # over the (zero) placeholder boundaries and trains garbage.
+    if boundaries is not None:
+        model.boundaries = boundaries.to(dtype=model.boundaries.dtype)
 
     model.config.pad_token_id = model.generation_config.pad_token_id = pad_token_id
     model.config.eos_token_id = model.generation_config.eos_token_id = eos_token_id
