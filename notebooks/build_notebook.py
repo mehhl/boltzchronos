@@ -360,20 +360,21 @@ CELLS.append(code(r"""
                 nn.init.zeros_(self.mean_scale_head[layer].bias)
 
             if boundaries is None:
-                # Placeholder; train.py overwrites with the tokenizer's real
-                # boundaries (length d_vocab - n_special_tokens - 1 + 2 = 4094
-                # for the default 4096-token config).
-                n_bin_edges = d_vocab - n_special_tokens - 1 + 2
+                # Placeholder; matches the chronos MeanScaleUniformBins
+                # geometry. Default vocab=4096, n_special=2 -> 4094 edges,
+                # 4093 inner bins, 3 init slots (pad, eos, unused-below).
+                n_bin_edges = d_vocab - n_special_tokens
                 boundaries = torch.zeros(n_bin_edges)
-            self.register_buffer("boundaries", boundaries)
+            # persistent=False: boundaries are externally determined by the
+            # chronos tokenizer; saving them in the state_dict creates
+            # shape-mismatch traps on reload after save_pretrained.
+            self.register_buffer("boundaries", boundaries, persistent=False)
 
-            # Number of init slots needed so the final distribution covers all
-            # d_vocab token IDs. With the default Chronos tokenizer this is 3
-            # (pad, eos, and an unused "bucket below -1e20" slot).
             n_init = d_vocab - (boundaries.numel() - 1)
             self.register_buffer(
                 "init_log_probs",
                 torch.full((n_init,), -1e9),
+                persistent=False,
             )
 
         def _censored_gaussian_logprobs(self, mu, sigma):

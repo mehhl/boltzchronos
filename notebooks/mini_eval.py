@@ -114,11 +114,19 @@ class T5ForMeanScalePatched(T5ForConditionalGeneration):
             nn.init.xavier_uniform_(self.mean_scale_head[layer].weight)
             nn.init.zeros_(self.mean_scale_head[layer].bias)
         if boundaries is None:
-            n_bin_edges = d_vocab - n_special_tokens - 1 + 2
+            # Match the chronos MeanScaleUniformBins geometry: with default
+            # vocab=4096 and 2 special tokens, n_bin_edges=4094 (so n_init=3,
+            # matching the original train.py's init_probs=[0,0,0]).
+            n_bin_edges = d_vocab - n_special_tokens
             boundaries = torch.zeros(n_bin_edges)
-        self.register_buffer("boundaries", boundaries)
+        # persistent=False so save_pretrained doesn't pickle the buffer; we
+        # always override from the tokenizer at load time anyway, and keeping
+        # them in the state_dict creates shape-mismatch traps on reload.
+        self.register_buffer("boundaries", boundaries, persistent=False)
         n_init = d_vocab - (boundaries.numel() - 1)
-        self.register_buffer("init_log_probs", torch.full((n_init,), -1e9))
+        self.register_buffer(
+            "init_log_probs", torch.full((n_init,), -1e9), persistent=False,
+        )
 
     def _censored_gaussian_logprobs(self, mu, sigma):
         b = self.boundaries.to(mu.device).unsqueeze(0)
