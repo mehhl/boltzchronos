@@ -355,9 +355,13 @@ CELLS.append(code(r"""
                 nn.Linear(128, 16),     nn.ReLU(),
                 nn.Linear(16, 2),
             )
-            for layer in (0, 2, 4):
-                nn.init.xavier_uniform_(self.mean_scale_head[layer].weight)
-                nn.init.zeros_(self.mean_scale_head[layer].bias)
+            # Tag for _init_weights. Direct nn.init calls in __init__ no-op
+            # under from_pretrained's meta-tensor path, leaving the layers
+            # with uninitialised memory after materialisation.
+            for layer in self.mean_scale_head:
+                if isinstance(layer, nn.Linear):
+                    layer._is_mean_scale_head = True
+            self._init_mean_scale_head()
 
             if boundaries is None:
                 # Placeholder; matches the chronos MeanScaleUniformBins
@@ -376,6 +380,20 @@ CELLS.append(code(r"""
                 torch.full((n_init,), -1e9),
                 persistent=False,
             )
+
+        def _init_mean_scale_head(self):
+            for layer in self.mean_scale_head:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+
+        def _init_weights(self, module):
+            super()._init_weights(module)
+            if isinstance(module, nn.Linear) and getattr(module, "_is_mean_scale_head", False):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
         def _censored_gaussian_logprobs(self, mu, sigma):
             '''mu, sigma: (B,) -> log-probs of shape (B, vocab).'''

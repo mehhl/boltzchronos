@@ -110,9 +110,14 @@ class T5ForMeanScalePatched(T5ForConditionalGeneration):
             nn.Linear(128, 16), nn.ReLU(),
             nn.Linear(16, 2),
         )
-        for layer in (0, 2, 4):
-            nn.init.xavier_uniform_(self.mean_scale_head[layer].weight)
-            nn.init.zeros_(self.mean_scale_head[layer].bias)
+        # Tag the MLP Linears so _init_weights can find them. Direct
+        # nn.init calls here would no-op under the meta-tensor path that
+        # from_pretrained uses, leaving the layers with uninitialised
+        # memory after materialisation.
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                layer._is_mean_scale_head = True
+        self._init_mean_scale_head()
         if boundaries is None:
             # Match the chronos MeanScaleUniformBins geometry: with default
             # vocab=4096 and 2 special tokens, n_bin_edges=4094 (so n_init=3,
@@ -127,6 +132,23 @@ class T5ForMeanScalePatched(T5ForConditionalGeneration):
         self.register_buffer(
             "init_log_probs", torch.full((n_init,), -1e9), persistent=False,
         )
+
+    def _init_mean_scale_head(self):
+        for layer in self.mean_scale_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        # T5's _init_weights leaves generic nn.Linear untouched; under
+        # from_pretrained's meta-tensor path that produces uninitialised
+        # memory in mean_scale_head. Re-init any Linear we marked.
+        if isinstance(module, nn.Linear) and getattr(module, "_is_mean_scale_head", False):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def _censored_gaussian_logprobs(self, mu, sigma):
         b = self.boundaries.to(mu.device).unsqueeze(0)
