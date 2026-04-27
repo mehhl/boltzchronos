@@ -432,13 +432,17 @@ def main():
         gen_kernelsynth(synth_path, n_synth=n_synth)
         out_dir = REPO_ROOT / "output/run-mini-patched"
         t0 = time.time()
+        # pred_len must match chronos_config.prediction_length (=64 for the
+        # pretrained chronos-t5-tiny tokenizer). The tokenizer's
+        # label_input_transform asserts this, so we can't just dial it down
+        # for CPU. ctx_len is still tunable.
         ckpt = fine_tune_patched(
             out_dir=out_dir,
             synth_path=synth_path,
             max_steps=steps,
             batch_size=batch,
             ctx_len=128,
-            pred_len=8,
+            pred_len=64,
         )
         print(f"  fine-tune: {time.time() - t0:.1f}s -> {ckpt}")
         train_steps = steps

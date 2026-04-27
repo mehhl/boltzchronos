@@ -161,3 +161,7 @@ cython_debug/
 
 # macOS stuff
 .DS_store
+
+# boltzchronos run artifacts (mini_eval / notebook)
+data/
+output/
